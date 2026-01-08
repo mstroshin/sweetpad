@@ -52,6 +52,7 @@ type WorkspaceTypes = {
   "testing.xcodeConfiguration": string;
   "testing.xcodeDestination": SelectedDestination;
   "testing.xcodeScheme": string;
+  "testing.selectedTestPlan": string;
 };
 
 type WorkspaceStateKey = keyof WorkspaceTypes;

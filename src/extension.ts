@@ -57,7 +57,9 @@ import {
 import { ProgressStatusBar } from "./system/status-bar.js";
 import {
   buildForTestingCommand,
+  refreshTestPlansCommand,
   selectConfigurationForTestingCommand,
+  selectTestPlanCommand,
   selectTestingTargetCommand,
   selectXcodeSchemeForTestingCommand,
   testWithoutBuildingCommand,
@@ -167,6 +169,8 @@ export function activate(context: vscode.ExtensionContext) {
   d(command("sweetpad.testing.selectTarget", selectTestingTargetCommand));
   d(command("sweetpad.testing.setDefaultScheme", selectXcodeSchemeForTestingCommand));
   d(command("sweetpad.testing.selectConfiguration", selectConfigurationForTestingCommand));
+  d(command("sweetpad.testing.selectTestPlan", selectTestPlanCommand));
+  d(command("sweetpad.testing.refreshTestPlans", refreshTestPlansCommand));
 
   // Debugging
   d(registerDebugConfigurationProvider(_context));

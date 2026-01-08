@@ -5,7 +5,8 @@ import { showConfigurationPicker, showYesNoQuestion } from "../common/askers";
 import { getBuildConfigurations } from "../common/cli/scripts";
 import type { ExtensionContext } from "../common/commands";
 import { updateWorkspaceConfig } from "../common/config";
-import { showInputBox } from "../common/quick-pick";
+import { showInputBox, showQuickPick } from "../common/quick-pick";
+import type { ParsedTestPlan } from "./testplan";
 import { askSchemeForTesting, askTestingTarget } from "./utils";
 
 export async function selectTestingTargetCommand(context: ExtensionContext): Promise<void> {
@@ -86,4 +87,72 @@ export async function selectConfigurationForTestingCommand(context: ExtensionCon
   } else {
     context.buildManager.setDefaultConfigurationForTesting(selected);
   }
+}
+
+/**
+ * Command to select a test plan for testing
+ */
+export async function selectTestPlanCommand(context: ExtensionContext): Promise<void> {
+  context.updateProgressStatus("Discovering test plans");
+
+  // Discover available test plans
+  const testPlans = await context.testingManager.discoverTestPlans();
+
+  if (testPlans.length === 0) {
+    vscode.window.showInformationMessage(
+      "No test plans found in the workspace. Test plans are .xctestplan files typically located in your Xcode project.",
+    );
+    return;
+  }
+
+  // Get currently selected test plan
+  const currentPlan = context.testingManager.getSelectedTestPlan();
+
+  // Build quick pick items
+  interface TestPlanPickItem {
+    label: string;
+    description?: string;
+    detail?: string;
+    context: ParsedTestPlan | null;
+  }
+
+  const items: TestPlanPickItem[] = [
+    {
+      label: "$(close) None (use all tests)",
+      description: currentPlan === undefined ? "(current)" : undefined,
+      detail: "Run tests without a specific test plan",
+      context: null,
+    },
+    ...testPlans.map((plan) => ({
+      label: `$(beaker) ${plan.name}`,
+      description: currentPlan?.path === plan.path ? "(current)" : undefined,
+      detail: `${plan.plan.testTargets.length} test target(s) - ${plan.path}`,
+      context: plan,
+    })),
+  ];
+
+  const selected = await showQuickPick<ParsedTestPlan | null>({
+    title: "Select a test plan",
+    items: items,
+  });
+
+  // Update selected test plan
+  context.testingManager.setSelectedTestPlan(selected.context ?? undefined);
+
+  if (selected.context) {
+    vscode.window.showInformationMessage(`Selected test plan: ${selected.context.name}`);
+  } else {
+    vscode.window.showInformationMessage("Test plan selection cleared");
+  }
+}
+
+/**
+ * Command to refresh/rediscover test plans
+ */
+export async function refreshTestPlansCommand(context: ExtensionContext): Promise<void> {
+  context.updateProgressStatus("Refreshing test plans");
+
+  const testPlans = await context.testingManager.discoverTestPlans();
+
+  vscode.window.showInformationMessage(`Found ${testPlans.length} test plan(s)`);
 }

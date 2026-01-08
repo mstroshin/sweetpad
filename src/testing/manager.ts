@@ -10,6 +10,7 @@ import { isFileExists } from "../common/files.js";
 import { commonLogger } from "../common/logger.js";
 import { runTask } from "../common/tasks.js";
 import type { Destination } from "../destination/types.js";
+import { type ParsedTestPlan, isTestIncludedInTarget, loadTestPlans } from "./testplan.js";
 import { askConfigurationForTesting, askDestinationToTestOn, askSchemeForTesting, askTestingTarget } from "./utils.js";
 
 type TestingInlineError = {
@@ -217,6 +218,10 @@ export class TestingManager {
   // Root folder of the workspace (VSCode, not Xcode)
   readonly workspacePath: string;
 
+  // Test plan support
+  private _selectedTestPlan: ParsedTestPlan | undefined;
+  private _availableTestPlans: ParsedTestPlan[] = [];
+
   constructor() {
     this.workspacePath = getWorkspacePath();
 
@@ -299,6 +304,87 @@ export class TestingManager {
   getDefaultTestingTarget(): string | undefined {
     return this.context.getWorkspaceState("testing.xcodeTarget");
   }
+
+  // ============= Test Plan Methods =============
+
+  /**
+   * Get the currently selected test plan
+   */
+  getSelectedTestPlan(): ParsedTestPlan | undefined {
+    return this._selectedTestPlan;
+  }
+
+  /**
+   * Set the selected test plan
+   */
+  setSelectedTestPlan(testPlan: ParsedTestPlan | undefined): void {
+    this._selectedTestPlan = testPlan;
+    this.context.updateWorkspaceState("testing.selectedTestPlan", testPlan?.path);
+
+    commonLogger.debug("Selected test plan changed", {
+      testPlan: testPlan?.name,
+      path: testPlan?.path,
+    });
+  }
+
+  /**
+   * Get available test plans
+   */
+  getAvailableTestPlans(): ParsedTestPlan[] {
+    return this._availableTestPlans;
+  }
+
+  /**
+   * Discover and load all test plans from the workspace
+   */
+  async discoverTestPlans(): Promise<ParsedTestPlan[]> {
+    const testPlans = await loadTestPlans(this.workspacePath);
+    this._availableTestPlans = testPlans;
+
+    commonLogger.debug("Discovered test plans", {
+      count: testPlans.length,
+      plans: testPlans.map((p) => p.name),
+    });
+
+    // Restore previously selected test plan if available
+    const savedPath = this.context.getWorkspaceState("testing.selectedTestPlan");
+    if (savedPath) {
+      const savedPlan = testPlans.find((p) => p.path === savedPath);
+      if (savedPlan) {
+        this._selectedTestPlan = savedPlan;
+      }
+    }
+
+    return testPlans;
+  }
+
+  /**
+   * Get test targets from the selected test plan
+   */
+  getTestPlanTargets(): string[] {
+    if (!this._selectedTestPlan) {
+      return [];
+    }
+    return this._selectedTestPlan.plan.testTargets.map((t) => t.target.name);
+  }
+
+  /**
+   * Check if a test is included in the current test plan
+   */
+  isTestIncludedInSelectedPlan(testId: string, targetName: string): boolean {
+    if (!this._selectedTestPlan) {
+      return true; // No test plan selected, include all tests
+    }
+
+    const target = this._selectedTestPlan.plan.testTargets.find((t) => t.target.name === targetName);
+    if (!target) {
+      return false; // Target not in test plan
+    }
+
+    return isTestIncludedInTarget(testId, target);
+  }
+
+  // ============= End Test Plan Methods =============
 
   /**
    * Create a new test item for the given document with additional context data
@@ -651,9 +737,27 @@ export class TestingManager {
     scheme: string;
     destination: Destination;
     xcworkspace: string;
+    testPlan?: string;
   }) {
     this.context.updateProgressStatus("Building for testing");
     const destinationRaw = getXcodeBuildDestinationString({ destination: options.destination });
+
+    // Build the base arguments
+    const args = [
+      "build-for-testing",
+      "-destination",
+      destinationRaw,
+      "-allowProvisioningUpdates",
+      "-scheme",
+      options.scheme,
+      "-workspace",
+      options.xcworkspace,
+    ];
+
+    // Add test plan if specified
+    if (options.testPlan) {
+      args.push("-testPlan", options.testPlan);
+    }
 
     // todo: add xcodebeautify command to format output
 
@@ -664,16 +768,7 @@ export class TestingManager {
       callback: async (terminal) => {
         await terminal.execute({
           command: "xcodebuild",
-          args: [
-            "build-for-testing",
-            "-destination",
-            destinationRaw,
-            "-allowProvisioningUpdates",
-            "-scheme",
-            options.scheme,
-            "-workspace",
-            options.xcworkspace,
-          ],
+          args: args,
         });
       },
     });
@@ -1013,8 +1108,9 @@ export class TestingManager {
     destination: Destination;
     scheme: string;
     token: vscode.CancellationToken;
+    testPlan?: string;
   }) {
-    const { xcworkspace, scheme, token, run, request } = options;
+    const { xcworkspace, scheme, token, run, request, testPlan } = options;
 
     const queue = this.prepareQueueForRun(request);
 
@@ -1026,6 +1122,7 @@ export class TestingManager {
     commonLogger.debug("Running tests", {
       scheme: scheme,
       xcworkspace: xcworkspace,
+      testPlan: testPlan,
       tests: queue.map((test) => test.id),
     });
 
@@ -1053,6 +1150,7 @@ export class TestingManager {
           destination: options.destination,
           scheme: scheme,
           defaultTarget: defaultTarget,
+          testPlan: testPlan,
         });
       } else {
         await this.runClassTest({
@@ -1062,6 +1160,7 @@ export class TestingManager {
           xcworkspace: xcworkspace,
           destination: options.destination,
           defaultTarget: defaultTarget,
+          testPlan: testPlan,
         });
       }
     }
@@ -1076,6 +1175,9 @@ export class TestingManager {
     try {
       const { scheme, destination, xcworkspace } = await this.askTestingConfigurations();
 
+      // Get selected test plan name if available
+      const testPlan = this._selectedTestPlan?.name;
+
       // todo: add check if project is already built
 
       this.context.updateProgressStatus("Running tests");
@@ -1086,6 +1188,7 @@ export class TestingManager {
         destination: destination,
         scheme: scheme,
         token: token,
+        testPlan: testPlan,
       });
     } finally {
       run.end();
@@ -1100,12 +1203,16 @@ export class TestingManager {
     try {
       const { scheme, destination, xcworkspace } = await this.askTestingConfigurations();
 
+      // Get selected test plan name if available
+      const testPlan = this._selectedTestPlan?.name;
+
       // before testing we need to build the project to avoid runnning tests on old code or
       // building every time we run selected tests
       await this.buildForTesting({
         scheme: scheme,
         destination: destination,
         xcworkspace: xcworkspace,
+        testPlan: testPlan,
       });
 
       await this.runTests({
@@ -1115,6 +1222,7 @@ export class TestingManager {
         destination: destination,
         scheme: scheme,
         token: token,
+        testPlan: testPlan,
       });
     } finally {
       run.end();
@@ -1155,8 +1263,9 @@ export class TestingManager {
     xcworkspace: string;
     destination: Destination;
     defaultTarget: string | null;
+    testPlan?: string;
   }): Promise<void> {
-    const { run, classTest, scheme, defaultTarget } = options;
+    const { run, classTest, scheme, defaultTarget, testPlan } = options;
     const className = classTest.id;
 
     const runContext = new XcodebuildTestRunContext({
@@ -1181,6 +1290,23 @@ export class TestingManager {
       framework,
     });
 
+    // Build xcodebuild arguments
+    const xcodebuildArgs = [
+      "test-without-building",
+      "-workspace",
+      options.xcworkspace,
+      "-destination",
+      destinationRaw,
+      "-scheme",
+      scheme,
+      `-only-testing:${testIdentifier}`,
+    ];
+
+    // Add test plan if specified
+    if (testPlan) {
+      xcodebuildArgs.push("-testPlan", testPlan);
+    }
+
     run.started(classTest);
 
     try {
@@ -1191,16 +1317,7 @@ export class TestingManager {
         callback: async (terminal) => {
           await terminal.execute({
             command: "xcodebuild",
-            args: [
-              "test-without-building",
-              "-workspace",
-              options.xcworkspace,
-              "-destination",
-              destinationRaw,
-              "-scheme",
-              scheme,
-              `-only-testing:${testIdentifier}`,
-            ],
+            args: xcodebuildArgs,
             onOutputLine: async (output) => {
               await this.parseOutputLine({
                 line: output.value,
@@ -1247,8 +1364,9 @@ export class TestingManager {
     scheme: string;
     destination: Destination;
     defaultTarget: string | null;
+    testPlan?: string;
   }): Promise<void> {
-    const { run: testRun, methodTest, scheme, defaultTarget } = options;
+    const { run: testRun, methodTest, scheme, defaultTarget, testPlan } = options;
     const [className, methodName] = methodTest.id.split(".");
 
     const runContext = new XcodebuildTestRunContext({
@@ -1275,6 +1393,23 @@ export class TestingManager {
 
     const destinationRaw = getXcodeBuildDestinationString({ destination: options.destination });
 
+    // Build xcodebuild arguments
+    const xcodebuildArgs = [
+      "test-without-building",
+      "-workspace",
+      options.xcworkspace,
+      "-destination",
+      destinationRaw,
+      "-scheme",
+      scheme,
+      `-only-testing:${testIdentifier}`,
+    ];
+
+    // Add test plan if specified
+    if (testPlan) {
+      xcodebuildArgs.push("-testPlan", testPlan);
+    }
+
     // Run "xcodebuild" command as a task to see the test output
     await runTask(this.context, {
       name: "sweetpad.build.test",
@@ -1284,16 +1419,7 @@ export class TestingManager {
         try {
           await terminal.execute({
             command: "xcodebuild",
-            args: [
-              "test-without-building",
-              "-workspace",
-              options.xcworkspace,
-              "-destination",
-              destinationRaw,
-              "-scheme",
-              scheme,
-              `-only-testing:${testIdentifier}`,
-            ],
+            args: xcodebuildArgs,
             onOutputLine: async (output) => {
               await this.parseOutputLine({
                 line: output.value,

@@ -400,6 +400,16 @@
         "icon": "$(file-directory)"
       },
       {
+        "command": "sweetpad.testing.selectTestPlan",
+        "title": "SweetPad.Testing: Select test plan",
+        "icon": "$(beaker)"
+      },
+      {
+        "command": "sweetpad.testing.refreshTestPlans",
+        "title": "SweetPad.Testing: Refresh test plans",
+        "icon": "$(refresh)"
+      },
+      {
         "command": "sweetpad.xcodegen.generate",
         "title": "SweetPad: Generate an Xcode project using XcodeGen",
         "icon": "$(file-code)"
@@ -677,12 +687,16 @@
           "group": "context@1"
         },
         {
-          "command": "sweetpad.testing.buildForTesting",
+          "command": "sweetpad.testing.selectTestPlan",
           "group": "context@2"
         },
         {
+          "command": "sweetpad.testing.buildForTesting",
+          "group": "context@3"
+        },
+        {
           "command": "sweetpad.testing.testWithoutBuilding",
-          "group": "inline@3"
+          "group": "inline@4"
         }
       ]
     },
