@@ -331,22 +331,24 @@ export class TestingManager {
   // "✔ Test testExample(value:) passed after 0.001 seconds."
   // "✔ Test "display name" with 2 test cases passed after 0.001 seconds."
   // Note: The symbols ◇ (lozenge), ✔ (checkmark), ✘ (cross), ➜ (arrow) are used by Swift Testing
+  // Note: Output may contain zero-width characters (U+200B, U+FEFF) at the start of lines
   readonly SWIFT_TESTING_METHOD_STATUS_REGEXP =
-    /^[◇✔✘➜] Test (?:"([^"]+)"|(\w+)\([^)]*\))(?:\s+with\s+\d+\s+test\s+cases?)? (started|passed|failed|skipped)/;
+    /^[\u200B\uFEFF]*[◇✔✘➜] Test (?:"([^"]+)"|(\w+)\([^)]*\))(?:\s+with\s+\d+\s+test\s+cases?)? (started|passed|failed|skipped)/;
 
   // Swift Testing suite status (optional, for @Suite decorated types)
   // Example: "◇ Suite MySuiteTests started."
   // Example: "✔ Suite MySuiteTests passed after 0.011 seconds."
   // Example with display name: "◇ Suite "My Suite Name" started."
   // Example: "➜ Suite MySuiteTests skipped."
-  readonly SWIFT_TESTING_SUITE_STATUS_REGEXP = /^[◇✔✘➜] Suite (?:"([^"]+)"|(\w+)) (started|passed|failed|skipped)/;
+  readonly SWIFT_TESTING_SUITE_STATUS_REGEXP =
+    /^[\u200B\uFEFF]*[◇✔✘➜] Suite (?:"([^"]+)"|(\w+)) (started|passed|failed|skipped)/;
 
   // Swift Testing inline error pattern
   // Example: "✘ Test testExample() recorded an issue at FileName.swift:24:19: Expectation failed: ..."
   // Example: "✘ Test "test name" recorded an issue at /path/to/File.swift:10:5: message"
   // Example with parameterized test: "✘ Test testExample(value:) recorded an issue at File.swift:10:5: message"
   readonly SWIFT_TESTING_INLINE_ERROR_REGEXP =
-    /^✘ Test (?:"([^"]+)"|(\w+)\([^)]*\)) recorded an issue at ([^:]+):(\d+):\d+: (.*)/;
+    /^[\u200B\uFEFF]*✘ Test (?:"([^"]+)"|(\w+)\([^)]*\)) recorded an issue at ([^:]+):(\d+):\d+: (.*)/;
 
   // Here we are storign additional data for test items. Weak map garanties that we
   // don't keep the items in memory if they are not used anymore
