@@ -28,15 +28,36 @@ class XcodebuildTestRunContext {
   private failedMethodTests = new Set<string>();
   private inlineErrorMap = new Map<string, TestingInlineError>();
   private methodTests: Map<string, vscode.TestItem>;
+  // Map display name to test item for Swift Testing
+  private displayNameMap: Map<string, vscode.TestItem>;
 
   constructor(options: {
     methodTests: Iterable<[string, vscode.TestItem]>;
+    testItemsContext?: WeakMap<vscode.TestItem, TestItemContext>;
   }) {
     this.methodTests = new Map(options.methodTests);
+    this.displayNameMap = new Map();
+
+    // Build display name map for Swift Testing
+    if (options.testItemsContext) {
+      for (const [, testItem] of this.methodTests) {
+        const context = options.testItemsContext.get(testItem);
+        if (context?.displayName) {
+          this.displayNameMap.set(context.displayName, testItem);
+        }
+      }
+    }
   }
 
   getMethodTest(methodTestId: string): vscode.TestItem | undefined {
     return this.methodTests.get(methodTestId);
+  }
+
+  /**
+   * Get test item by display name (for Swift Testing)
+   */
+  getMethodTestByDisplayName(displayName: string): vscode.TestItem | undefined {
+    return this.displayNameMap.get(displayName);
   }
 
   addProcessedMethodTest(methodTestId: string): void {
@@ -131,6 +152,17 @@ function* getAncestorsPaths(options: {
  */
 type TestItemContext = {
   type: "class" | "method";
+  /**
+   * The testing framework used for this test item.
+   * - "xctest": XCTestCase-based tests
+   * - "swift-testing": Swift Testing framework tests (@Test, @Suite)
+   */
+  framework: "xctest" | "swift-testing";
+  /**
+   * Display name from @Test("...") or @Suite("...") macro.
+   * Used to match test output with test items.
+   */
+  displayName?: string;
   spmTarget?: string;
 };
 
@@ -156,6 +188,27 @@ export class TestingManager {
   // "Test case 'terminal23TesMakarenko1ts.testExample2()' passed on 'Clone 1 of iPhone 14 - terminal23 (27767)' (0.000 seconds)"
   // "Test case 'terminal23TesMakarenko1ts.testPerformanceExample()' passed on 'Clone 1 of iPhone 14 - terminal23 (27767)' (0.254 seconds)"
   readonly METHOD_STATUS_REGEXP_IOS = /Test case '(.*)\.(.*)\(\)' (.*)/;
+
+  // Swift Testing framework output patterns
+  // Example output:
+  // "◇ Test testExample() started."
+  // "✔ Test testExample() passed after 0.001 seconds."
+  // "✘ Test testExample() failed after 0.001 seconds."
+  // "◇ Test "Test with display name" started."
+  // "✔ Test "Test with display name" passed after 0.001 seconds."
+  // Note: The symbols ◇ (lozenge), ✔ (checkmark), ✘ (cross) are used by Swift Testing
+  readonly SWIFT_TESTING_METHOD_STATUS_REGEXP = /^[◇✔✘] Test (?:"([^"]+)"|(\w+)\(\)) (started|passed|failed)/;
+
+  // Swift Testing suite status (optional, for @Suite decorated types)
+  // Example: "◇ Suite MySuiteTests started."
+  // Example: "✔ Suite MySuiteTests passed after 0.011 seconds."
+  readonly SWIFT_TESTING_SUITE_STATUS_REGEXP = /^[◇✔✘] Suite (\w+) (started|passed|failed)/;
+
+  // Swift Testing inline error pattern
+  // Example: "✘ Test testExample() recorded an issue at FileName.swift:24:19: Expectation failed: ..."
+  // Example: "✘ Test "test name" recorded an issue at /path/to/File.swift:10:5: message"
+  readonly SWIFT_TESTING_INLINE_ERROR_REGEXP =
+    /^✘ Test (?:"([^"]+)"|(\w+)\(\)) recorded an issue at ([^:]+):(\d+):\d+: (.*)/;
 
   // Here we are storign additional data for test items. Weak map garanties that we
   // don't keep the items in memory if they are not used anymore
@@ -255,10 +308,14 @@ export class TestingManager {
     label: string;
     uri: vscode.Uri;
     type: TestItemContext["type"];
+    framework: TestItemContext["framework"];
+    displayName?: string;
   }): vscode.TestItem {
     const testItem = this.controller.createTestItem(options.id, options.label, options.uri);
     this.testItems.set(testItem, {
       type: options.type,
+      framework: options.framework,
+      displayName: options.displayName,
     });
     return testItem;
   }
@@ -283,9 +340,20 @@ export class TestingManager {
 
     const text = document.getText();
 
+    // Find XCTest classes and methods
+    this.findXCTestItems(document, text);
+
+    // Find Swift Testing @Test and @Suite items
+    this.findSwiftTestingItems(document, text);
+  }
+
+  /**
+   * Find XCTestCase classes and their test methods
+   */
+  private findXCTestItems(document: vscode.TextDocument, text: string) {
     // Regex to find classes inheriting from XCTestCase
     const classRegex = /class\s+(\w+)\s*:\s*XCTestCase\s*\{/g;
-    // let classMatch;
+
     while (true) {
       const classMatch = classRegex.exec(text);
       if (classMatch === null) {
@@ -300,6 +368,7 @@ export class TestingManager {
         label: className,
         uri: document.uri,
         type: "class",
+        framework: "xctest",
       });
       classTestItem.range = new vscode.Range(classPosition, classPosition);
       this.controller.items.add(classTestItem);
@@ -327,10 +396,200 @@ export class TestingManager {
           label: testName,
           uri: document.uri,
           type: "method",
+          framework: "xctest",
         });
 
         testItem.range = new vscode.Range(position, position);
         classTestItem.children.add(testItem);
+      }
+    }
+  }
+
+  /**
+   * Extract display name from @Test("...") or @Suite("...") macro
+   * Returns undefined if no display name is specified
+   */
+  private extractDisplayName(macroText: string): string | undefined {
+    // Match @Test("display name") or @Suite("display name")
+    // The display name is the first string argument
+    const displayNameMatch = macroText.match(/@(?:Test|Suite)\s*\(\s*"([^"]+)"/);
+    return displayNameMatch?.[1];
+  }
+
+  /**
+   * Find Swift Testing @Suite and @Test items
+   */
+  private findSwiftTestingItems(document: vscode.TextDocument, text: string) {
+    // Find @Suite decorated structs/classes/actors
+    // Pattern: @Suite followed by optional parameters, then struct/class/actor declaration
+    // Capture the full @Suite(...) to extract display name
+    const suiteRegex = /(@Suite(?:\s*\([^)]*\))?)\s*(?:struct|class|actor)\s+(\w+)/g;
+
+    // Track found suites and their test items
+    const suiteItems = new Map<string, vscode.TestItem>();
+
+    while (true) {
+      const suiteMatch = suiteRegex.exec(text);
+      if (suiteMatch === null) {
+        break;
+      }
+      const suiteDeclaration = suiteMatch[1]; // @Suite or @Suite("...")
+      const suiteName = suiteMatch[2];
+      const suitePosition = document.positionAt(suiteMatch.index);
+      const displayName = this.extractDisplayName(suiteDeclaration);
+
+      // Skip if this suite was already added as XCTestCase
+      if (this.controller.items.get(suiteName)) {
+        continue;
+      }
+
+      const suiteTestItem = this.createTestItem({
+        id: suiteName,
+        label: suiteName,
+        uri: document.uri,
+        type: "class",
+        framework: "swift-testing",
+        displayName: displayName,
+      });
+      suiteTestItem.range = new vscode.Range(suitePosition, suitePosition);
+      this.controller.items.add(suiteTestItem);
+      suiteItems.set(suiteName, suiteTestItem);
+    }
+
+    // Find @Test decorated functions
+    // Pattern: @Test followed by optional parameters, then func declaration
+    // The @Test can have display name: @Test("My test name")
+    // The function name doesn't need to start with "test"
+    // Capture the full @Test(...) to extract display name
+    const testRegex = /(@Test(?:\s*\([^)]*\))?)\s*func\s+(\w+)\s*\(/g;
+
+    while (true) {
+      const testMatch = testRegex.exec(text);
+      if (testMatch === null) {
+        break;
+      }
+      const testDeclaration = testMatch[1]; // @Test or @Test("...")
+      const testName = testMatch[2]; // function name
+      const testPosition = document.positionAt(testMatch.index);
+      const displayName = this.extractDisplayName(testDeclaration);
+
+      // Try to find which suite this test belongs to by checking if it's inside a suite's code block
+      let parentSuite: vscode.TestItem | undefined;
+      let parentSuiteName: string | undefined;
+
+      for (const [suiteName, suiteItem] of suiteItems) {
+        // Find the suite declaration and its code block
+        const suiteBlockRegex = new RegExp(
+          `@Suite(?:\\s*\\([^)]*\\))?\\s*(?:struct|class|actor)\\s+${suiteName}\\s*[^{]*\\{`,
+          "g",
+        );
+        const suiteBlockMatch = suiteBlockRegex.exec(text);
+
+        if (suiteBlockMatch) {
+          const suiteStartIndex = suiteBlockMatch.index + suiteBlockMatch[0].length - 1;
+          const suiteCode = extractCodeBlock(text, suiteStartIndex);
+
+          if (suiteCode) {
+            const suiteEndIndex = suiteStartIndex + suiteCode.length;
+            // Check if the test is within this suite's code block
+            if (testMatch.index > suiteStartIndex && testMatch.index < suiteEndIndex) {
+              parentSuite = suiteItem;
+              parentSuiteName = suiteName;
+              break;
+            }
+          }
+        }
+      }
+
+      // Also check for non-@Suite structs/classes that contain @Test methods
+      if (!parentSuite) {
+        // Find any struct/class/actor that contains this test
+        const containerRegex = /(?:struct|class|actor)\s+(\w+)[^{]*\{/g;
+
+        while (true) {
+          const containerMatch = containerRegex.exec(text);
+          if (containerMatch === null) {
+            break;
+          }
+
+          const containerName = containerMatch[1];
+          const containerStartIndex = containerMatch.index + containerMatch[0].length - 1;
+          const containerCode = extractCodeBlock(text, containerStartIndex);
+
+          if (containerCode) {
+            const containerEndIndex = containerStartIndex + containerCode.length;
+            // Check if the test is within this container's code block
+            if (testMatch.index > containerStartIndex && testMatch.index < containerEndIndex) {
+              // Check if we already have this container as a test item
+              let existingContainer = this.controller.items.get(containerName);
+
+              // Skip XCTestCase classes - they're handled by findXCTestItems
+              if (existingContainer) {
+                const context = this.testItems.get(existingContainer);
+                if (context?.framework === "xctest") {
+                  continue;
+                }
+              }
+
+              if (!existingContainer) {
+                // Create a new suite item for this container
+                const containerPosition = document.positionAt(containerMatch.index);
+                existingContainer = this.createTestItem({
+                  id: containerName,
+                  label: containerName,
+                  uri: document.uri,
+                  type: "class",
+                  framework: "swift-testing",
+                });
+                existingContainer.range = new vscode.Range(containerPosition, containerPosition);
+                this.controller.items.add(existingContainer);
+                suiteItems.set(containerName, existingContainer);
+              }
+
+              parentSuite = existingContainer;
+              parentSuiteName = containerName;
+              break;
+            }
+          }
+        }
+      }
+
+      if (parentSuite && parentSuiteName) {
+        // Test belongs to a suite
+        const testId = `${parentSuiteName}.${testName}`;
+
+        // Skip if already added
+        if (parentSuite.children.get(testId)) {
+          continue;
+        }
+
+        const testItem = this.createTestItem({
+          id: testId,
+          label: testName,
+          uri: document.uri,
+          type: "method",
+          framework: "swift-testing",
+          displayName: displayName,
+        });
+        testItem.range = new vscode.Range(testPosition, testPosition);
+        parentSuite.children.add(testItem);
+      } else {
+        // Standalone @Test function (not inside a suite)
+        // Skip if already added
+        if (this.controller.items.get(testName)) {
+          continue;
+        }
+
+        const testItem = this.createTestItem({
+          id: testName,
+          label: testName,
+          uri: document.uri,
+          type: "method",
+          framework: "swift-testing",
+          displayName: displayName,
+        });
+        testItem.range = new vscode.Range(testPosition, testPosition);
+        this.controller.items.add(testItem);
       }
     }
   }
@@ -523,6 +782,94 @@ export class TestingManager {
         lineNumber: Number.parseInt(lineNumber, 10),
         message: errorMessage,
       });
+      return;
+    }
+
+    // Swift Testing framework output parsing
+    // Example: "◇ Test testExample() started."
+    // Example: "✔ Test testExample() passed after 0.001 seconds."
+    // Example: "✘ Test testExample() failed after 0.001 seconds."
+    // Example: "✔ Test "init with value sets current timestamp" passed after 0.002 seconds."
+    const swiftTestingMethodMatch = line.match(this.SWIFT_TESTING_METHOD_STATUS_REGEXP);
+    if (swiftTestingMethodMatch) {
+      // Group 1: display name (if quoted), Group 2: function name (if not quoted), Group 3: status
+      const [, displayName, funcName, status] = swiftTestingMethodMatch;
+
+      // Try to find the test by display name first (for @Test("display name"))
+      // then by function name (for @Test func name())
+      let methodTest: vscode.TestItem | undefined;
+      let methodTestId: string | undefined;
+
+      if (displayName) {
+        // Try to find by display name
+        methodTest = runContext.getMethodTestByDisplayName(displayName);
+        if (methodTest) {
+          methodTestId = methodTest.id;
+        }
+      }
+
+      if (!methodTest && funcName) {
+        // Try by function name with className
+        methodTestId = `${className}.${funcName}`;
+        methodTest = runContext.getMethodTest(methodTestId);
+
+        // Try without className for standalone tests
+        if (!methodTest) {
+          methodTestId = funcName;
+          methodTest = runContext.getMethodTest(funcName);
+        }
+      }
+
+      if (!methodTest || !methodTestId) {
+        return;
+      }
+
+      if (status === "started") {
+        testRun.started(methodTest);
+      } else if (status === "passed") {
+        testRun.passed(methodTest);
+        runContext.addProcessedMethodTest(methodTestId);
+      } else if (status === "failed") {
+        const error = this.getMethodError({
+          methodTestId: methodTestId,
+          runContext: runContext,
+        });
+        testRun.failed(methodTest, error);
+        runContext.addProcessedMethodTest(methodTestId);
+        runContext.addFailedMethodTest(methodTestId);
+      }
+      return;
+    }
+
+    // Swift Testing inline error parsing
+    // Example: "✘ Test testExample() recorded an issue at FileName.swift:24:19: Expectation failed: ..."
+    // Example: "✘ Test "display name" recorded an issue at /path/to/File.swift:10:5: message"
+    const swiftTestingErrorMatch = line.match(this.SWIFT_TESTING_INLINE_ERROR_REGEXP);
+    if (swiftTestingErrorMatch) {
+      const [, displayName, funcName, filePath, lineNumber, errorMessage] = swiftTestingErrorMatch;
+
+      // Find test by display name or function name
+      let methodTest: vscode.TestItem | undefined;
+      let testId: string | undefined;
+
+      if (displayName) {
+        methodTest = runContext.getMethodTestByDisplayName(displayName);
+        if (methodTest) {
+          testId = methodTest.id;
+        }
+      }
+
+      if (!testId && funcName) {
+        testId = `${className}.${funcName}`;
+      }
+
+      if (testId) {
+        runContext.addInlineError(testId, {
+          fileName: filePath,
+          lineNumber: Number.parseInt(lineNumber, 10),
+          message: errorMessage,
+        });
+      }
       return;
     }
   }
@@ -774,6 +1121,33 @@ export class TestingManager {
     }
   }
 
+  /**
+   * Get the test identifier for xcodebuild -only-testing parameter.
+   * Swift Testing uses a different format with parentheses for function names.
+   */
+  private getTestIdentifier(options: {
+    testTarget: string;
+    className: string;
+    methodName?: string;
+    framework: TestItemContext["framework"];
+  }): string {
+    const { testTarget, className, methodName, framework } = options;
+
+    if (!methodName) {
+      // Class/Suite level test
+      return `${testTarget}/${className}`;
+    }
+
+    if (framework === "swift-testing") {
+      // Swift Testing requires parentheses in function names
+      // Format: Target/SuiteName/testName()
+      return `${testTarget}/${className}/${methodName}()`;
+    }
+
+    // XCTest format: Target/ClassName/methodName
+    return `${testTarget}/${className}/${methodName}`;
+  }
+
   async runClassTest(options: {
     run: vscode.TestRun;
     classTest: vscode.TestItem;
@@ -787,16 +1161,25 @@ export class TestingManager {
 
     const runContext = new XcodebuildTestRunContext({
       methodTests: [...classTest.children],
+      testItemsContext: this.testItems,
     });
 
     const destinationRaw = getXcodeBuildDestinationString({ destination: options.destination });
 
     // Some test items like SPM packages have a separate target for tests, in other case we use
     // the same target for all selected tests
-    const testTarget = this.testItems.get(classTest)?.spmTarget ?? defaultTarget;
+    const testItemContext = this.testItems.get(classTest);
+    const testTarget = testItemContext?.spmTarget ?? defaultTarget;
     if (!testTarget) {
       throw new Error("Test target is not defined");
     }
+
+    const framework = testItemContext?.framework ?? "xctest";
+    const testIdentifier = this.getTestIdentifier({
+      testTarget,
+      className,
+      framework,
+    });
 
     run.started(classTest);
 
@@ -816,7 +1199,7 @@ export class TestingManager {
               destinationRaw,
               "-scheme",
               scheme,
-              `-only-testing:${testTarget}/${classTest.id}`,
+              `-only-testing:${testIdentifier}`,
             ],
             onOutputLine: async (output) => {
               await this.parseOutputLine({
@@ -870,15 +1253,25 @@ export class TestingManager {
 
     const runContext = new XcodebuildTestRunContext({
       methodTests: [[methodTest.id, methodTest]],
+      testItemsContext: this.testItems,
     });
 
     // Some test items like SPM packages have a separate target for tests, in other case we use
     // the same target for all selected tests
-    const testTarget = this.testItems.get(methodTest)?.spmTarget ?? defaultTarget;
+    const testItemContext = this.testItems.get(methodTest);
+    const testTarget = testItemContext?.spmTarget ?? defaultTarget;
 
     if (!testTarget) {
       throw new Error("Test target is not defined");
     }
+
+    const framework = testItemContext?.framework ?? "xctest";
+    const testIdentifier = this.getTestIdentifier({
+      testTarget,
+      className,
+      methodName,
+      framework,
+    });
 
     const destinationRaw = getXcodeBuildDestinationString({ destination: options.destination });
 
@@ -899,7 +1292,7 @@ export class TestingManager {
               destinationRaw,
               "-scheme",
               scheme,
-              `-only-testing:${testTarget}/${className}/${methodName}`,
+              `-only-testing:${testIdentifier}`,
             ],
             onOutputLine: async (output) => {
               await this.parseOutputLine({
