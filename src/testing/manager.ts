@@ -1222,6 +1222,10 @@ export class TestingManager {
   /**
    * Get the test identifier for xcodebuild -only-testing parameter.
    * Swift Testing uses a different format with parentheses for function names.
+   *
+   * Note: xcodebuild strips the last pair of parentheses from the identifier,
+   * so we need to add double parentheses "()()" for Swift Testing tests.
+   * See: https://trinhngocthuyen.com/posts/tech/swift-testing-and-xcodebuild/
    */
   private getTestIdentifier(options: {
     testTarget: string;
@@ -1237,9 +1241,9 @@ export class TestingManager {
     }
 
     if (framework === "swift-testing") {
-      // Swift Testing requires parentheses in function names
-      // Format: Target/SuiteName/testName()
-      return `${testTarget}/${className}/${methodName}()`;
+      // Swift Testing requires double parentheses because xcodebuild strips the last pair
+      // Format: Target/SuiteName/testName()()
+      return `${testTarget}/${className}/${methodName}()()`;
     }
 
     // XCTest format: Target/ClassName/methodName
