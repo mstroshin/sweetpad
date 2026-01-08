@@ -127,6 +127,55 @@ function extractCodeBlock(text: string, startIndex: number): string | null {
 }
 
 /**
+ * Extracts macro arguments from text starting at the opening parenthesis.
+ * Handles nested parentheses and strings correctly.
+ *
+ * @param text - The source text
+ * @param startIndex - Index of the opening parenthesis '('
+ * @returns The content including parentheses, or null if not found
+ *
+ * Examples:
+ * - extractMacroArguments('@Test("name") func', 5) => '("name")'
+ * - extractMacroArguments('@Test("test (parens)") func', 5) => '("test (parens)")'
+ * - extractMacroArguments('@Test(arguments: [(1, 2)]) func', 5) => '(arguments: [(1, 2)])'
+ */
+function extractMacroArguments(text: string, startIndex: number): string | null {
+  if (text[startIndex] !== "(") {
+    return null;
+  }
+
+  let parenCount = 0;
+  let inString = false;
+  let stringChar = "";
+
+  for (let i = startIndex; i < text.length; i++) {
+    const char = text[i];
+    const prevChar = i > 0 ? text[i - 1] : "";
+
+    // Handle string boundaries (skip escaped quotes)
+    if ((char === '"' || char === "'") && prevChar !== "\\") {
+      if (!inString) {
+        inString = true;
+        stringChar = char;
+      } else if (char === stringChar) {
+        inString = false;
+        stringChar = "";
+      }
+    } else if (!inString) {
+      if (char === "(") {
+        parenCount++;
+      } else if (char === ")") {
+        parenCount--;
+        if (parenCount === 0) {
+          return text.substring(startIndex, i + 1);
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
  * Get all ancestor paths of a childPath that are within the parentPath (including the parentPath).
  */
 function* getAncestorsPaths(options: {
@@ -194,21 +243,29 @@ export class TestingManager {
   // "◇ Test testExample() started."
   // "✔ Test testExample() passed after 0.001 seconds."
   // "✘ Test testExample() failed after 0.001 seconds."
+  // "➜ Test testExample() skipped."
   // "◇ Test "Test with display name" started."
   // "✔ Test "Test with display name" passed after 0.001 seconds."
-  // Note: The symbols ◇ (lozenge), ✔ (checkmark), ✘ (cross) are used by Swift Testing
-  readonly SWIFT_TESTING_METHOD_STATUS_REGEXP = /^[◇✔✘] Test (?:"([^"]+)"|(\w+)\(\)) (started|passed|failed)/;
+  // Parameterized tests with arguments:
+  // "◇ Test testExample(value:) started."
+  // "✔ Test testExample(value:) passed after 0.001 seconds."
+  // Note: The symbols ◇ (lozenge), ✔ (checkmark), ✘ (cross), ➜ (arrow) are used by Swift Testing
+  readonly SWIFT_TESTING_METHOD_STATUS_REGEXP =
+    /^[◇✔✘➜] Test (?:"([^"]+)"|(\w+)\([^)]*\)) (started|passed|failed|skipped)/;
 
   // Swift Testing suite status (optional, for @Suite decorated types)
   // Example: "◇ Suite MySuiteTests started."
   // Example: "✔ Suite MySuiteTests passed after 0.011 seconds."
-  readonly SWIFT_TESTING_SUITE_STATUS_REGEXP = /^[◇✔✘] Suite (\w+) (started|passed|failed)/;
+  // Example with display name: "◇ Suite "My Suite Name" started."
+  // Example: "➜ Suite MySuiteTests skipped."
+  readonly SWIFT_TESTING_SUITE_STATUS_REGEXP = /^[◇✔✘➜] Suite (?:"([^"]+)"|(\w+)) (started|passed|failed|skipped)/;
 
   // Swift Testing inline error pattern
   // Example: "✘ Test testExample() recorded an issue at FileName.swift:24:19: Expectation failed: ..."
   // Example: "✘ Test "test name" recorded an issue at /path/to/File.swift:10:5: message"
+  // Example with parameterized test: "✘ Test testExample(value:) recorded an issue at File.swift:10:5: message"
   readonly SWIFT_TESTING_INLINE_ERROR_REGEXP =
-    /^✘ Test (?:"([^"]+)"|(\w+)\(\)) recorded an issue at ([^:]+):(\d+):\d+: (.*)/;
+    /^✘ Test (?:"([^"]+)"|(\w+)\([^)]*\)) recorded an issue at ([^:]+):(\d+):\d+: (.*)/;
 
   // Here we are storign additional data for test items. Weak map garanties that we
   // don't keep the items in memory if they are not used anymore
@@ -421,21 +478,41 @@ export class TestingManager {
    */
   private findSwiftTestingItems(document: vscode.TextDocument, text: string) {
     // Find @Suite decorated structs/classes/actors
-    // Pattern: @Suite followed by optional parameters, then struct/class/actor declaration
-    // Capture the full @Suite(...) to extract display name
-    const suiteRegex = /(@Suite(?:\s*\([^)]*\))?)\s*(?:struct|class|actor)\s+(\w+)/g;
+    // First find @Suite, then extract arguments with nested parentheses support
+    // Pattern matches @Suite with optional whitespace before arguments or type declaration
+    const suiteStartRegex = /@Suite\s*/g;
 
     // Track found suites and their test items
     const suiteItems = new Map<string, vscode.TestItem>();
 
     while (true) {
-      const suiteMatch = suiteRegex.exec(text);
-      if (suiteMatch === null) {
+      const suiteStartMatch = suiteStartRegex.exec(text);
+      if (suiteStartMatch === null) {
         break;
       }
-      const suiteDeclaration = suiteMatch[1]; // @Suite or @Suite("...")
-      const suiteName = suiteMatch[2];
-      const suitePosition = document.positionAt(suiteMatch.index);
+
+      const macroStartIndex = suiteStartMatch.index;
+      let afterMacroIndex = macroStartIndex + suiteStartMatch[0].length;
+      let suiteDeclaration = "@Suite";
+
+      // Check if there are arguments (starts with '(')
+      if (text[afterMacroIndex] === "(") {
+        const args = extractMacroArguments(text, afterMacroIndex);
+        if (args) {
+          suiteDeclaration = `@Suite${args}`;
+          afterMacroIndex += args.length;
+        }
+      }
+
+      // Skip whitespace after macro
+      const afterMacroText = text.substring(afterMacroIndex);
+      const typeMatch = afterMacroText.match(/^\s*(?:struct|class|actor)\s+(\w+)/);
+      if (!typeMatch) {
+        continue;
+      }
+
+      const suiteName = typeMatch[1];
+      const suitePosition = document.positionAt(macroStartIndex);
       const displayName = this.extractDisplayName(suiteDeclaration);
 
       // Skip if this suite was already added as XCTestCase
@@ -457,20 +534,40 @@ export class TestingManager {
     }
 
     // Find @Test decorated functions
-    // Pattern: @Test followed by optional parameters, then func declaration
+    // First find @Test, then extract arguments with nested parentheses support
     // The @Test can have display name: @Test("My test name")
+    // The @Test can have nested parens: @Test("test (something)", arguments: [(1, 2)])
     // The function name doesn't need to start with "test"
-    // Capture the full @Test(...) to extract display name
-    const testRegex = /(@Test(?:\s*\([^)]*\))?)\s*func\s+(\w+)\s*\(/g;
+    const testStartRegex = /@Test\s*/g;
 
     while (true) {
-      const testMatch = testRegex.exec(text);
-      if (testMatch === null) {
+      const testStartMatch = testStartRegex.exec(text);
+      if (testStartMatch === null) {
         break;
       }
-      const testDeclaration = testMatch[1]; // @Test or @Test("...")
-      const testName = testMatch[2]; // function name
-      const testPosition = document.positionAt(testMatch.index);
+
+      const macroStartIndex = testStartMatch.index;
+      let afterMacroIndex = macroStartIndex + testStartMatch[0].length;
+      let testDeclaration = "@Test";
+
+      // Check if there are arguments (starts with '(')
+      if (text[afterMacroIndex] === "(") {
+        const args = extractMacroArguments(text, afterMacroIndex);
+        if (args) {
+          testDeclaration = `@Test${args}`;
+          afterMacroIndex += args.length;
+        }
+      }
+
+      // Skip whitespace and find func declaration
+      const afterMacroText = text.substring(afterMacroIndex);
+      const funcMatch = afterMacroText.match(/^\s*func\s+(\w+)\s*\(/);
+      if (!funcMatch) {
+        continue;
+      }
+
+      const testName = funcMatch[1]; // function name
+      const testPosition = document.positionAt(macroStartIndex);
       const displayName = this.extractDisplayName(testDeclaration);
 
       // Try to find which suite this test belongs to by checking if it's inside a suite's code block
@@ -479,20 +576,18 @@ export class TestingManager {
 
       for (const [suiteName, suiteItem] of suiteItems) {
         // Find the suite declaration and its code block
-        const suiteBlockRegex = new RegExp(
-          `@Suite(?:\\s*\\([^)]*\\))?\\s*(?:struct|class|actor)\\s+${suiteName}\\s*[^{]*\\{`,
-          "g",
-        );
-        const suiteBlockMatch = suiteBlockRegex.exec(text);
+        // Use a simpler approach: find type declaration by name and then locate the opening brace
+        const typeDeclarationRegex = new RegExp(`(?:struct|class|actor)\\s+${suiteName}\\s*[^{]*\\{`, "g");
+        const typeMatch = typeDeclarationRegex.exec(text);
 
-        if (suiteBlockMatch) {
-          const suiteStartIndex = suiteBlockMatch.index + suiteBlockMatch[0].length - 1;
+        if (typeMatch) {
+          const suiteStartIndex = typeMatch.index + typeMatch[0].length - 1;
           const suiteCode = extractCodeBlock(text, suiteStartIndex);
 
           if (suiteCode) {
             const suiteEndIndex = suiteStartIndex + suiteCode.length;
             // Check if the test is within this suite's code block
-            if (testMatch.index > suiteStartIndex && testMatch.index < suiteEndIndex) {
+            if (macroStartIndex > suiteStartIndex && macroStartIndex < suiteEndIndex) {
               parentSuite = suiteItem;
               parentSuiteName = suiteName;
               break;
@@ -519,7 +614,7 @@ export class TestingManager {
           if (containerCode) {
             const containerEndIndex = containerStartIndex + containerCode.length;
             // Check if the test is within this container's code block
-            if (testMatch.index > containerStartIndex && testMatch.index < containerEndIndex) {
+            if (macroStartIndex > containerStartIndex && macroStartIndex < containerEndIndex) {
               // Check if we already have this container as a test item
               let existingContainer = this.controller.items.get(containerName);
 
@@ -837,6 +932,9 @@ export class TestingManager {
         testRun.failed(methodTest, error);
         runContext.addProcessedMethodTest(methodTestId);
         runContext.addFailedMethodTest(methodTestId);
+      } else if (status === "skipped") {
+        testRun.skipped(methodTest);
+        runContext.addProcessedMethodTest(methodTestId);
       }
       return;
     }
