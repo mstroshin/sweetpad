@@ -176,6 +176,80 @@ function extractMacroArguments(text: string, startIndex: number): string | null 
 }
 
 /**
+ * Extracts parameter labels from a Swift function signature.
+ * Used for Swift Testing parameterized tests where xcodebuild needs the parameter labels.
+ *
+ * @param paramsContent - The content inside parentheses, e.g., "query: String, expectedTitles: [String]"
+ * @returns Parameter labels in Swift format, e.g., "query:expectedTitles:" or empty string if no params
+ *
+ * Examples:
+ * - "query: String, expectedTitles: [String]" => "query:expectedTitles:"
+ * - "_ value: Int" => "_:" (external label is underscore)
+ * - "value: Int" => "value:"
+ * - "" => ""
+ */
+function extractParameterLabels(paramsContent: string): string {
+  if (!paramsContent.trim()) {
+    return "";
+  }
+
+  const labels: string[] = [];
+
+  // Split by commas, but be careful with generic types like [String] or Dictionary<K, V>
+  let depth = 0;
+  let currentParam = "";
+
+  for (const char of paramsContent) {
+    if (char === "<" || char === "[" || char === "(") {
+      depth++;
+      currentParam += char;
+    } else if (char === ">" || char === "]" || char === ")") {
+      depth--;
+      currentParam += char;
+    } else if (char === "," && depth === 0) {
+      // End of parameter
+      const label = extractSingleParameterLabel(currentParam.trim());
+      if (label) labels.push(label);
+      currentParam = "";
+    } else {
+      currentParam += char;
+    }
+  }
+
+  // Don't forget the last parameter
+  if (currentParam.trim()) {
+    const label = extractSingleParameterLabel(currentParam.trim());
+    if (label) labels.push(label);
+  }
+
+  return labels.length > 0 ? `${labels.join(":")}:` : "";
+}
+
+/**
+ * Extract the external parameter label from a single Swift parameter declaration.
+ * Swift parameters can have: "externalName internalName: Type" or just "name: Type"
+ */
+function extractSingleParameterLabel(param: string): string | null {
+  // Remove attributes like @escaping
+  const cleanParam = param.replace(/@\w+\s*/g, "").trim();
+
+  // Match: [externalLabel] internalLabel: Type
+  // Examples: "query: String", "_ value: Int", "with value: Int"
+  const match = cleanParam.match(/^(\w+|\\_)(?:\s+\w+)?:/);
+  if (match) {
+    return match[1] === "\\_" ? "_" : match[1];
+  }
+
+  // Try simpler pattern: just "name:"
+  const simpleMatch = cleanParam.match(/^(\w+|_)\s*:/);
+  if (simpleMatch) {
+    return simpleMatch[1];
+  }
+
+  return null;
+}
+
+/**
  * Get all ancestor paths of a childPath that are within the parentPath (including the parentPath).
  */
 function* getAncestorsPaths(options: {
@@ -212,6 +286,12 @@ type TestItemContext = {
    * Used to match test output with test items.
    */
   displayName?: string;
+  /**
+   * Parameter labels for parameterized Swift Testing tests.
+   * Example: "query:expectedTitles:" for func test(query: String, expectedTitles: [String])
+   * Used in xcodebuild -only-testing identifier: Target/Suite/testName(query:expectedTitles:)
+   */
+  parameterLabels?: string;
   spmTarget?: string;
 };
 
@@ -367,12 +447,14 @@ export class TestingManager {
     type: TestItemContext["type"];
     framework: TestItemContext["framework"];
     displayName?: string;
+    parameterLabels?: string;
   }): vscode.TestItem {
     const testItem = this.controller.createTestItem(options.id, options.label, options.uri);
     this.testItems.set(testItem, {
       type: options.type,
       framework: options.framework,
       displayName: options.displayName,
+      parameterLabels: options.parameterLabels,
     });
     return testItem;
   }
@@ -570,6 +652,12 @@ export class TestingManager {
       const testPosition = document.positionAt(macroStartIndex);
       const displayName = this.extractDisplayName(testDeclaration);
 
+      // Extract function parameters for parameterized tests
+      // Find the opening parenthesis of func parameters and extract them
+      const funcParamsStartIndex = afterMacroIndex + funcMatch[0].length - 1; // position of '('
+      const funcParams = extractMacroArguments(text, funcParamsStartIndex);
+      const parameterLabels = funcParams ? extractParameterLabels(funcParams.slice(1, -1)) : "";
+
       // Try to find which suite this test belongs to by checking if it's inside a suite's code block
       let parentSuite: vscode.TestItem | undefined;
       let parentSuiteName: string | undefined;
@@ -665,6 +753,7 @@ export class TestingManager {
           type: "method",
           framework: "swift-testing",
           displayName: displayName,
+          parameterLabels: parameterLabels,
         });
         testItem.range = new vscode.Range(testPosition, testPosition);
         parentSuite.children.add(testItem);
@@ -682,6 +771,7 @@ export class TestingManager {
           type: "method",
           framework: "swift-testing",
           displayName: displayName,
+          parameterLabels: parameterLabels,
         });
         testItem.range = new vscode.Range(testPosition, testPosition);
         this.controller.items.add(testItem);
@@ -1226,14 +1316,18 @@ export class TestingManager {
    * Note: xcodebuild strips the last pair of parentheses from the identifier,
    * so we need to add double parentheses "()()" for Swift Testing tests.
    * See: https://trinhngocthuyen.com/posts/tech/swift-testing-and-xcodebuild/
+   *
+   * For parameterized tests, the parameter labels must be included:
+   * - testName(query:expectedTitles:)()
    */
   private getTestIdentifier(options: {
     testTarget: string;
     className: string;
     methodName?: string;
     framework: TestItemContext["framework"];
+    parameterLabels?: string;
   }): string {
-    const { testTarget, className, methodName, framework } = options;
+    const { testTarget, className, methodName, framework, parameterLabels } = options;
 
     if (!methodName) {
       // Class/Suite level test
@@ -1242,8 +1336,10 @@ export class TestingManager {
 
     if (framework === "swift-testing") {
       // Swift Testing requires double parentheses because xcodebuild strips the last pair
-      // Format: Target/SuiteName/testName()()
-      return `${testTarget}/${className}/${methodName}()()`;
+      // For parameterized tests include parameter labels: testName(param1:param2:)()
+      // For non-parameterized tests: testName()()
+      const params = parameterLabels || "";
+      return `${testTarget}/${className}/${methodName}(${params})()`;
     }
 
     // XCTest format: Target/ClassName/methodName
@@ -1368,11 +1464,13 @@ export class TestingManager {
     }
 
     const framework = testItemContext?.framework ?? "xctest";
+    const parameterLabels = testItemContext?.parameterLabels;
     const testIdentifier = this.getTestIdentifier({
       testTarget,
       className,
       methodName,
       framework,
+      parameterLabels,
     });
 
     const destinationRaw = getXcodeBuildDestinationString({ destination: options.destination });
