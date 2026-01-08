@@ -127,6 +127,129 @@ function extractCodeBlock(text: string, startIndex: number): string | null {
 }
 
 /**
+ * Extracts macro arguments from text starting at the opening parenthesis.
+ * Handles nested parentheses and strings correctly.
+ *
+ * @param text - The source text
+ * @param startIndex - Index of the opening parenthesis '('
+ * @returns The content including parentheses, or null if not found
+ *
+ * Examples:
+ * - extractMacroArguments('@Test("name") func', 5) => '("name")'
+ * - extractMacroArguments('@Test("test (parens)") func', 5) => '("test (parens)")'
+ * - extractMacroArguments('@Test(arguments: [(1, 2)]) func', 5) => '(arguments: [(1, 2)])'
+ */
+function extractMacroArguments(text: string, startIndex: number): string | null {
+  if (text[startIndex] !== "(") {
+    return null;
+  }
+
+  let parenCount = 0;
+  let inString = false;
+  let stringChar = "";
+
+  for (let i = startIndex; i < text.length; i++) {
+    const char = text[i];
+    const prevChar = i > 0 ? text[i - 1] : "";
+
+    // Handle string boundaries (skip escaped quotes)
+    if ((char === '"' || char === "'") && prevChar !== "\\") {
+      if (!inString) {
+        inString = true;
+        stringChar = char;
+      } else if (char === stringChar) {
+        inString = false;
+        stringChar = "";
+      }
+    } else if (!inString) {
+      if (char === "(") {
+        parenCount++;
+      } else if (char === ")") {
+        parenCount--;
+        if (parenCount === 0) {
+          return text.substring(startIndex, i + 1);
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Extracts parameter labels from a Swift function signature.
+ * Used for Swift Testing parameterized tests where xcodebuild needs the parameter labels.
+ *
+ * @param paramsContent - The content inside parentheses, e.g., "query: String, expectedTitles: [String]"
+ * @returns Parameter labels in Swift format, e.g., "query:expectedTitles:" or empty string if no params
+ *
+ * Examples:
+ * - "query: String, expectedTitles: [String]" => "query:expectedTitles:"
+ * - "_ value: Int" => "_:" (external label is underscore)
+ * - "value: Int" => "value:"
+ * - "" => ""
+ */
+function extractParameterLabels(paramsContent: string): string {
+  if (!paramsContent.trim()) {
+    return "";
+  }
+
+  const labels: string[] = [];
+
+  // Split by commas, but be careful with generic types like [String] or Dictionary<K, V>
+  let depth = 0;
+  let currentParam = "";
+
+  for (const char of paramsContent) {
+    if (char === "<" || char === "[" || char === "(") {
+      depth++;
+      currentParam += char;
+    } else if (char === ">" || char === "]" || char === ")") {
+      depth--;
+      currentParam += char;
+    } else if (char === "," && depth === 0) {
+      // End of parameter
+      const label = extractSingleParameterLabel(currentParam.trim());
+      if (label) labels.push(label);
+      currentParam = "";
+    } else {
+      currentParam += char;
+    }
+  }
+
+  // Don't forget the last parameter
+  if (currentParam.trim()) {
+    const label = extractSingleParameterLabel(currentParam.trim());
+    if (label) labels.push(label);
+  }
+
+  return labels.length > 0 ? `${labels.join(":")}:` : "";
+}
+
+/**
+ * Extract the external parameter label from a single Swift parameter declaration.
+ * Swift parameters can have: "externalName internalName: Type" or just "name: Type"
+ */
+function extractSingleParameterLabel(param: string): string | null {
+  // Remove attributes like @escaping
+  const cleanParam = param.replace(/@\w+\s*/g, "").trim();
+
+  // Match: [externalLabel] internalLabel: Type
+  // Examples: "query: String", "_ value: Int", "with value: Int"
+  const match = cleanParam.match(/^(\w+|\\_)(?:\s+\w+)?:/);
+  if (match) {
+    return match[1] === "\\_" ? "_" : match[1];
+  }
+
+  // Try simpler pattern: just "name:"
+  const simpleMatch = cleanParam.match(/^(\w+|_)\s*:/);
+  if (simpleMatch) {
+    return simpleMatch[1];
+  }
+
+  return null;
+}
+
+/**
  * Get all ancestor paths of a childPath that are within the parentPath (including the parentPath).
  */
 function* getAncestorsPaths(options: {
@@ -163,6 +286,12 @@ type TestItemContext = {
    * Used to match test output with test items.
    */
   displayName?: string;
+  /**
+   * Parameter labels for parameterized Swift Testing tests.
+   * Example: "query:expectedTitles:" for func test(query: String, expectedTitles: [String])
+   * Used in xcodebuild -only-testing identifier: Target/Suite/testName(query:expectedTitles:)
+   */
+  parameterLabels?: string;
   spmTarget?: string;
 };
 
@@ -194,21 +323,33 @@ export class TestingManager {
   // "◇ Test testExample() started."
   // "✔ Test testExample() passed after 0.001 seconds."
   // "✘ Test testExample() failed after 0.001 seconds."
+  // "➜ Test testExample() skipped."
   // "◇ Test "Test with display name" started."
   // "✔ Test "Test with display name" passed after 0.001 seconds."
-  // Note: The symbols ◇ (lozenge), ✔ (checkmark), ✘ (cross) are used by Swift Testing
-  readonly SWIFT_TESTING_METHOD_STATUS_REGEXP = /^[◇✔✘] Test (?:"([^"]+)"|(\w+)\(\)) (started|passed|failed)/;
+  // Parameterized tests with arguments:
+  // "◇ Test testExample(value:) started."
+  // "✔ Test testExample(value:) passed after 0.001 seconds."
+  // "✔ Test "display name" with 2 test cases passed after 0.001 seconds."
+  // Note: The symbols ◇ (lozenge), ✔ (checkmark), ✘ (cross), ➜ (arrow) are used by Swift Testing
+  // Note: Output may contain zero-width characters (U+200B, U+FEFF) at the start of lines
+  readonly SWIFT_TESTING_METHOD_STATUS_REGEXP =
+    /^[\u200B\uFEFF]*[◇✔✘➜] Test (?:"([^"]+)"|(\w+)\([^)]*\))(?:\s+with\s+\d+\s+test\s+cases?)? (started|passed|failed|skipped)/;
 
   // Swift Testing suite status (optional, for @Suite decorated types)
   // Example: "◇ Suite MySuiteTests started."
   // Example: "✔ Suite MySuiteTests passed after 0.011 seconds."
-  readonly SWIFT_TESTING_SUITE_STATUS_REGEXP = /^[◇✔✘] Suite (\w+) (started|passed|failed)/;
+  // Example with display name: "◇ Suite "My Suite Name" started."
+  // Example: "➜ Suite MySuiteTests skipped."
+  readonly SWIFT_TESTING_SUITE_STATUS_REGEXP =
+    /^[\u200B\uFEFF]*[◇✔✘➜] Suite (?:"([^"]+)"|(\w+)) (started|passed|failed|skipped)/;
 
   // Swift Testing inline error pattern
   // Example: "✘ Test testExample() recorded an issue at FileName.swift:24:19: Expectation failed: ..."
   // Example: "✘ Test "test name" recorded an issue at /path/to/File.swift:10:5: message"
+  // Example with parameterized test: "✘ Test testExample(value:) recorded an issue at File.swift:10:5: message"
+  // Example with arguments: "✘ Test "name" recorded an issue with 2 arguments query → "x" at File.swift:10:5: message"
   readonly SWIFT_TESTING_INLINE_ERROR_REGEXP =
-    /^✘ Test (?:"([^"]+)"|(\w+)\(\)) recorded an issue at ([^:]+):(\d+):\d+: (.*)/;
+    /^[\u200B\uFEFF]*✘ Test (?:"([^"]+)"|(\w+)\([^)]*\)) recorded an issue.* at ([^\s:]+):(\d+):\d+: (.*)/;
 
   // Here we are storign additional data for test items. Weak map garanties that we
   // don't keep the items in memory if they are not used anymore
@@ -310,12 +451,14 @@ export class TestingManager {
     type: TestItemContext["type"];
     framework: TestItemContext["framework"];
     displayName?: string;
+    parameterLabels?: string;
   }): vscode.TestItem {
     const testItem = this.controller.createTestItem(options.id, options.label, options.uri);
     this.testItems.set(testItem, {
       type: options.type,
       framework: options.framework,
       displayName: options.displayName,
+      parameterLabels: options.parameterLabels,
     });
     return testItem;
   }
@@ -421,21 +564,41 @@ export class TestingManager {
    */
   private findSwiftTestingItems(document: vscode.TextDocument, text: string) {
     // Find @Suite decorated structs/classes/actors
-    // Pattern: @Suite followed by optional parameters, then struct/class/actor declaration
-    // Capture the full @Suite(...) to extract display name
-    const suiteRegex = /(@Suite(?:\s*\([^)]*\))?)\s*(?:struct|class|actor)\s+(\w+)/g;
+    // First find @Suite, then extract arguments with nested parentheses support
+    // Pattern matches @Suite with optional whitespace before arguments or type declaration
+    const suiteStartRegex = /@Suite\s*/g;
 
     // Track found suites and their test items
     const suiteItems = new Map<string, vscode.TestItem>();
 
     while (true) {
-      const suiteMatch = suiteRegex.exec(text);
-      if (suiteMatch === null) {
+      const suiteStartMatch = suiteStartRegex.exec(text);
+      if (suiteStartMatch === null) {
         break;
       }
-      const suiteDeclaration = suiteMatch[1]; // @Suite or @Suite("...")
-      const suiteName = suiteMatch[2];
-      const suitePosition = document.positionAt(suiteMatch.index);
+
+      const macroStartIndex = suiteStartMatch.index;
+      let afterMacroIndex = macroStartIndex + suiteStartMatch[0].length;
+      let suiteDeclaration = "@Suite";
+
+      // Check if there are arguments (starts with '(')
+      if (text[afterMacroIndex] === "(") {
+        const args = extractMacroArguments(text, afterMacroIndex);
+        if (args) {
+          suiteDeclaration = `@Suite${args}`;
+          afterMacroIndex += args.length;
+        }
+      }
+
+      // Skip whitespace after macro
+      const afterMacroText = text.substring(afterMacroIndex);
+      const typeMatch = afterMacroText.match(/^\s*(?:struct|class|actor)\s+(\w+)/);
+      if (!typeMatch) {
+        continue;
+      }
+
+      const suiteName = typeMatch[1];
+      const suitePosition = document.positionAt(macroStartIndex);
       const displayName = this.extractDisplayName(suiteDeclaration);
 
       // Skip if this suite was already added as XCTestCase
@@ -457,21 +620,47 @@ export class TestingManager {
     }
 
     // Find @Test decorated functions
-    // Pattern: @Test followed by optional parameters, then func declaration
+    // First find @Test, then extract arguments with nested parentheses support
     // The @Test can have display name: @Test("My test name")
+    // The @Test can have nested parens: @Test("test (something)", arguments: [(1, 2)])
     // The function name doesn't need to start with "test"
-    // Capture the full @Test(...) to extract display name
-    const testRegex = /(@Test(?:\s*\([^)]*\))?)\s*func\s+(\w+)\s*\(/g;
+    const testStartRegex = /@Test\s*/g;
 
     while (true) {
-      const testMatch = testRegex.exec(text);
-      if (testMatch === null) {
+      const testStartMatch = testStartRegex.exec(text);
+      if (testStartMatch === null) {
         break;
       }
-      const testDeclaration = testMatch[1]; // @Test or @Test("...")
-      const testName = testMatch[2]; // function name
-      const testPosition = document.positionAt(testMatch.index);
+
+      const macroStartIndex = testStartMatch.index;
+      let afterMacroIndex = macroStartIndex + testStartMatch[0].length;
+      let testDeclaration = "@Test";
+
+      // Check if there are arguments (starts with '(')
+      if (text[afterMacroIndex] === "(") {
+        const args = extractMacroArguments(text, afterMacroIndex);
+        if (args) {
+          testDeclaration = `@Test${args}`;
+          afterMacroIndex += args.length;
+        }
+      }
+
+      // Skip whitespace and find func declaration
+      const afterMacroText = text.substring(afterMacroIndex);
+      const funcMatch = afterMacroText.match(/^\s*func\s+(\w+)\s*\(/);
+      if (!funcMatch) {
+        continue;
+      }
+
+      const testName = funcMatch[1]; // function name
+      const testPosition = document.positionAt(macroStartIndex);
       const displayName = this.extractDisplayName(testDeclaration);
+
+      // Extract function parameters for parameterized tests
+      // Find the opening parenthesis of func parameters and extract them
+      const funcParamsStartIndex = afterMacroIndex + funcMatch[0].length - 1; // position of '('
+      const funcParams = extractMacroArguments(text, funcParamsStartIndex);
+      const parameterLabels = funcParams ? extractParameterLabels(funcParams.slice(1, -1)) : "";
 
       // Try to find which suite this test belongs to by checking if it's inside a suite's code block
       let parentSuite: vscode.TestItem | undefined;
@@ -479,20 +668,18 @@ export class TestingManager {
 
       for (const [suiteName, suiteItem] of suiteItems) {
         // Find the suite declaration and its code block
-        const suiteBlockRegex = new RegExp(
-          `@Suite(?:\\s*\\([^)]*\\))?\\s*(?:struct|class|actor)\\s+${suiteName}\\s*[^{]*\\{`,
-          "g",
-        );
-        const suiteBlockMatch = suiteBlockRegex.exec(text);
+        // Use a simpler approach: find type declaration by name and then locate the opening brace
+        const typeDeclarationRegex = new RegExp(`(?:struct|class|actor)\\s+${suiteName}\\s*[^{]*\\{`, "g");
+        const typeMatch = typeDeclarationRegex.exec(text);
 
-        if (suiteBlockMatch) {
-          const suiteStartIndex = suiteBlockMatch.index + suiteBlockMatch[0].length - 1;
+        if (typeMatch) {
+          const suiteStartIndex = typeMatch.index + typeMatch[0].length - 1;
           const suiteCode = extractCodeBlock(text, suiteStartIndex);
 
           if (suiteCode) {
             const suiteEndIndex = suiteStartIndex + suiteCode.length;
             // Check if the test is within this suite's code block
-            if (testMatch.index > suiteStartIndex && testMatch.index < suiteEndIndex) {
+            if (macroStartIndex > suiteStartIndex && macroStartIndex < suiteEndIndex) {
               parentSuite = suiteItem;
               parentSuiteName = suiteName;
               break;
@@ -519,7 +706,7 @@ export class TestingManager {
           if (containerCode) {
             const containerEndIndex = containerStartIndex + containerCode.length;
             // Check if the test is within this container's code block
-            if (testMatch.index > containerStartIndex && testMatch.index < containerEndIndex) {
+            if (macroStartIndex > containerStartIndex && macroStartIndex < containerEndIndex) {
               // Check if we already have this container as a test item
               let existingContainer = this.controller.items.get(containerName);
 
@@ -570,6 +757,7 @@ export class TestingManager {
           type: "method",
           framework: "swift-testing",
           displayName: displayName,
+          parameterLabels: parameterLabels,
         });
         testItem.range = new vscode.Range(testPosition, testPosition);
         parentSuite.children.add(testItem);
@@ -587,6 +775,7 @@ export class TestingManager {
           type: "method",
           framework: "swift-testing",
           displayName: displayName,
+          parameterLabels: parameterLabels,
         });
         testItem.range = new vscode.Range(testPosition, testPosition);
         this.controller.items.add(testItem);
@@ -837,6 +1026,9 @@ export class TestingManager {
         testRun.failed(methodTest, error);
         runContext.addProcessedMethodTest(methodTestId);
         runContext.addFailedMethodTest(methodTestId);
+      } else if (status === "skipped") {
+        testRun.skipped(methodTest);
+        runContext.addProcessedMethodTest(methodTestId);
       }
       return;
     }
@@ -1130,8 +1322,9 @@ export class TestingManager {
     className: string;
     methodName?: string;
     framework: TestItemContext["framework"];
+    parameterLabels?: string;
   }): string {
-    const { testTarget, className, methodName, framework } = options;
+    const { testTarget, className, methodName, framework, parameterLabels } = options;
 
     if (!methodName) {
       // Class/Suite level test
@@ -1139,9 +1332,9 @@ export class TestingManager {
     }
 
     if (framework === "swift-testing") {
-      // Swift Testing requires parentheses in function names
-      // Format: Target/SuiteName/testName()
-      return `${testTarget}/${className}/${methodName}()`;
+      // Swift Testing format: Target/SuiteName/testName(param:) or testName()
+      const params = parameterLabels || "";
+      return `${testTarget}/${className}/${methodName}(${params})`;
     }
 
     // XCTest format: Target/ClassName/methodName
@@ -1266,11 +1459,13 @@ export class TestingManager {
     }
 
     const framework = testItemContext?.framework ?? "xctest";
+    const parameterLabels = testItemContext?.parameterLabels;
     const testIdentifier = this.getTestIdentifier({
       testTarget,
       className,
       methodName,
       framework,
+      parameterLabels,
     });
 
     const destinationRaw = getXcodeBuildDestinationString({ destination: options.destination });
@@ -1304,9 +1499,11 @@ export class TestingManager {
             },
           });
         } catch (error) {
-          // todo: ??? can we extract error message from error object?
-          const errorMessage = error instanceof Error ? error.message : "Test failed";
-          testRun.failed(methodTest, new vscode.TestMessage(errorMessage));
+          // Only show error if test wasn't already processed (i.e., we didn't get proper test output)
+          if (!runContext.isMethodTestProcessed(methodTest.id)) {
+            const errorMessage = error instanceof Error ? error.message : "Test failed";
+            testRun.failed(methodTest, new vscode.TestMessage(errorMessage));
+          }
         } finally {
           if (!runContext.isMethodTestProcessed(methodTest.id)) {
             testRun.skipped(methodTest);
