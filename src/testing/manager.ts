@@ -329,9 +329,10 @@ export class TestingManager {
   // Parameterized tests with arguments:
   // "◇ Test testExample(value:) started."
   // "✔ Test testExample(value:) passed after 0.001 seconds."
+  // "✔ Test "display name" with 2 test cases passed after 0.001 seconds."
   // Note: The symbols ◇ (lozenge), ✔ (checkmark), ✘ (cross), ➜ (arrow) are used by Swift Testing
   readonly SWIFT_TESTING_METHOD_STATUS_REGEXP =
-    /^[◇✔✘➜] Test (?:"([^"]+)"|(\w+)\([^)]*\)) (started|passed|failed|skipped)/;
+    /^[◇✔✘➜] Test (?:"([^"]+)"|(\w+)\([^)]*\))(?:\s+with\s+\d+\s+test\s+cases?)? (started|passed|failed|skipped)/;
 
   // Swift Testing suite status (optional, for @Suite decorated types)
   // Example: "◇ Suite MySuiteTests started."
