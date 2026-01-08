@@ -156,3 +156,15 @@ export async function refreshTestPlansCommand(context: ExtensionContext): Promis
 
   vscode.window.showInformationMessage(`Found ${testPlans.length} test plan(s)`);
 }
+
+/**
+ * Command to refresh/rediscover all tests in the workspace
+ */
+export async function refreshTestsCommand(context: ExtensionContext): Promise<void> {
+  context.updateProgressStatus("Discovering tests");
+
+  await context.testingManager.refreshAllTests();
+
+  const testCount = context.testingManager.controller.items.size;
+  vscode.window.showInformationMessage(`Discovered ${testCount} test class(es)`);
+}

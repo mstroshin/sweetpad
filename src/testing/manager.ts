@@ -227,6 +227,16 @@ export class TestingManager {
 
     this.controller = vscode.tests.createTestController("sweetpad", "SweetPad");
 
+    // Set up resolve handler to discover tests when Testing Explorer is opened
+    // This is called when the user expands a test item or opens the test explorer
+    this.controller.resolveHandler = async (item) => {
+      if (!item) {
+        // Root level - discover all tests
+        await this.discoverAllTests();
+      }
+      // For child items, tests are already discovered during file parsing
+    };
+
     // Register event listeners for updating test items when documents change or open
     vscode.workspace.onDidOpenTextDocument((document) => this.updateTestItems(document));
     vscode.workspace.onDidChangeTextDocument((event) => this.updateTestItems(event.document));
@@ -385,6 +395,79 @@ export class TestingManager {
   }
 
   // ============= End Test Plan Methods =============
+
+  /**
+   * Discover all tests from Swift files in the workspace.
+   * This scans for test files and parses them to populate the test explorer.
+   */
+  async discoverAllTests(): Promise<void> {
+    commonLogger.debug("Discovering all tests in workspace");
+
+    try {
+      // Find all Swift files that likely contain tests
+      // Look in common test directories and files ending with Tests.swift
+      const testFilePatterns = [
+        "**/*Tests.swift",
+        "**/*Test.swift",
+        "**/Tests/**/*.swift",
+        "**/*UITests/**/*.swift",
+        "**/*Specs.swift",
+      ];
+
+      const excludePattern = "{**/node_modules/**,**/DerivedData/**,**/build/**,**/.build/**,**/Pods/**}";
+
+      const allTestFiles = new Set<string>();
+
+      for (const pattern of testFilePatterns) {
+        const relativePattern = new vscode.RelativePattern(this.workspacePath, pattern);
+        const files = await vscode.workspace.findFiles(relativePattern, excludePattern);
+        for (const file of files) {
+          allTestFiles.add(file.fsPath);
+        }
+      }
+
+      commonLogger.debug("Found potential test files", {
+        count: allTestFiles.size,
+      });
+
+      // Read and parse each file to extract tests
+      for (const filePath of allTestFiles) {
+        try {
+          const uri = vscode.Uri.file(filePath);
+          const document = await vscode.workspace.openTextDocument(uri);
+          this.updateTestItems(document);
+        } catch (error) {
+          commonLogger.debug("Failed to parse test file", {
+            filePath,
+            error,
+          });
+        }
+      }
+
+      commonLogger.debug("Test discovery completed", {
+        totalTests: this.controller.items.size,
+      });
+    } catch (error) {
+      commonLogger.error("Error discovering tests", { error });
+    }
+  }
+
+  /**
+   * Refresh all tests - clears existing and rediscovers
+   */
+  async refreshAllTests(): Promise<void> {
+    // Clear existing test items
+    const itemsToDelete: string[] = [];
+    this.controller.items.forEach((item) => {
+      itemsToDelete.push(item.id);
+    });
+    for (const id of itemsToDelete) {
+      this.controller.items.delete(id);
+    }
+
+    // Rediscover all tests
+    await this.discoverAllTests();
+  }
 
   /**
    * Create a new test item for the given document with additional context data

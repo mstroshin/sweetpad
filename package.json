@@ -410,6 +410,11 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "sweetpad.testing.refreshTests",
+        "title": "SweetPad.Testing: Refresh tests (discover all)",
+        "icon": "$(refresh)"
+      },
+      {
         "command": "sweetpad.xcodegen.generate",
         "title": "SweetPad: Generate an Xcode project using XcodeGen",
         "icon": "$(file-code)"
