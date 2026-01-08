@@ -1313,12 +1313,10 @@ export class TestingManager {
    * Get the test identifier for xcodebuild -only-testing parameter.
    * Swift Testing uses a different format with parentheses for function names.
    *
-   * Note: xcodebuild strips the last pair of parentheses from the identifier,
-   * so we need to add double parentheses "()()" for Swift Testing tests.
+   * Note: xcodebuild strips the last pair of parentheses "()" from the identifier,
+   * so we need to add double parentheses "()()" for non-parameterized Swift Testing tests.
+   * For parameterized tests, the identifier ends with ":)" which is not stripped.
    * See: https://trinhngocthuyen.com/posts/tech/swift-testing-and-xcodebuild/
-   *
-   * For parameterized tests, the parameter labels must be included:
-   * - testName(query:expectedTitles:)()
    */
   private getTestIdentifier(options: {
     testTarget: string;
@@ -1335,11 +1333,14 @@ export class TestingManager {
     }
 
     if (framework === "swift-testing") {
-      // Swift Testing requires double parentheses because xcodebuild strips the last pair
-      // For parameterized tests include parameter labels: testName(param1:param2:)()
-      // For non-parameterized tests: testName()()
-      const params = parameterLabels || "";
-      return `${testTarget}/${className}/${methodName}(${params})()`;
+      if (parameterLabels) {
+        // Parameterized tests: testName(param1:param2:)
+        // No extra () needed because xcodebuild only strips trailing "()"
+        return `${testTarget}/${className}/${methodName}(${parameterLabels})`;
+      }
+      // Non-parameterized tests need double parentheses because xcodebuild strips the last pair
+      // testName()() -> xcodebuild strips -> testName()
+      return `${testTarget}/${className}/${methodName}()()`;
     }
 
     // XCTest format: Target/ClassName/methodName
