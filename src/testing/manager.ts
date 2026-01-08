@@ -347,8 +347,9 @@ export class TestingManager {
   // Example: "✘ Test testExample() recorded an issue at FileName.swift:24:19: Expectation failed: ..."
   // Example: "✘ Test "test name" recorded an issue at /path/to/File.swift:10:5: message"
   // Example with parameterized test: "✘ Test testExample(value:) recorded an issue at File.swift:10:5: message"
+  // Example with arguments: "✘ Test "name" recorded an issue with 2 arguments query → "x" at File.swift:10:5: message"
   readonly SWIFT_TESTING_INLINE_ERROR_REGEXP =
-    /^[\u200B\uFEFF]*✘ Test (?:"([^"]+)"|(\w+)\([^)]*\)) recorded an issue at ([^:]+):(\d+):\d+: (.*)/;
+    /^[\u200B\uFEFF]*✘ Test (?:"([^"]+)"|(\w+)\([^)]*\)) recorded an issue.* at ([^:]+\.\w+):(\d+):\d+: (.*)/;
 
   // Here we are storign additional data for test items. Weak map garanties that we
   // don't keep the items in memory if they are not used anymore
